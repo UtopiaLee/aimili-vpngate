@@ -248,6 +248,13 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
             pass
 
 def start_proxy_server(host: str, port: int) -> None:
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"[安全警告] 代理网关绑定在 {host}:{port}，该地址可被外部访问！"
+            f" 本代理不做身份认证，任何能访问该地址的人都可借此匿名出站。"
+            f" 强烈建议仅绑定 127.0.0.1，并由上游 (如 Xray) 通过本机回环接入。",
+            flush=True,
+        )
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

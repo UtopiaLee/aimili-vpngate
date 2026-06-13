@@ -55,12 +55,21 @@ CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
 
 lock = threading.RLock()
 active_sessions: dict[str, float] = {}
+# Per-IP login throttling: ip -> (fail_count, locked_until_epoch)
+login_attempts: dict[str, tuple[int, float]] = {}
+LOGIN_MAX_FAILS = int(os.environ.get("LOGIN_MAX_FAILS", "5"))
+LOGIN_LOCKOUT_SECONDS = int(os.environ.get("LOGIN_LOCKOUT_SECONDS", "300"))
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 is_connecting = True
+# True only while connect_node() is actively establishing a tunnel. Distinct
+# from is_connecting (which also covers startup and UI state) so maintenance
+# can yield specifically to an in-flight connection without deadlocking.
+connect_in_progress = False
 last_active_ping_time = 0.0
 last_active_latency = 0
 
@@ -88,6 +97,7 @@ def read_json(path: Path, default: Any) -> Any:
             return default
 
 import hashlib
+import hmac
 import random
 
 def generate_random_password() -> str:
@@ -154,6 +164,58 @@ def load_ui_config() -> dict[str, Any]:
 def get_session_token(password: str, username: str = "admin") -> str:
     salt = "aimilivpn_secure_salt_2026"
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
+
+def login_locked_remaining(ip: str) -> float:
+    with lock:
+        entry = login_attempts.get(ip)
+        if not entry:
+            return 0.0
+        fails, locked_until = entry
+        remaining = locked_until - time.time()
+        return remaining if remaining > 0 else 0.0
+
+def register_login_failure(ip: str) -> None:
+    with lock:
+        fails, _ = login_attempts.get(ip, (0, 0.0))
+        fails += 1
+        locked_until = time.time() + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILS else 0.0
+        login_attempts[ip] = (fails, locked_until)
+
+def reset_login_failures(ip: str) -> None:
+    with lock:
+        login_attempts.pop(ip, None)
+
+def save_sessions() -> None:
+    """Persist active_sessions to disk. Caller must hold `lock`."""
+    try:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        tmp = SESSIONS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(active_sessions), encoding="utf-8")
+        tmp.replace(SESSIONS_FILE)
+        try:
+            SESSIONS_FILE.chmod(0o600)
+        except OSError:
+            pass
+    except Exception as e:
+        print(f"[会话持久化] 写入失败: {e}", flush=True)
+
+def load_sessions() -> None:
+    """Load persisted sessions at startup, dropping any that have expired."""
+    try:
+        if not SESSIONS_FILE.exists():
+            return
+        data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        with lock:
+            active_sessions.clear()
+            for token, exp in data.items():
+                try:
+                    if float(exp) > now:
+                        active_sessions[token] = float(exp)
+                except (TypeError, ValueError):
+                    continue
+    except Exception as e:
+        print(f"[会话持久化] 读取失败: {e}", flush=True)
 
 def cleanup_old_logs(logs_dir: Path) -> None:
     try:
@@ -422,12 +484,16 @@ def kill_existing_openvpn_processes() -> None:
     if not sys.platform.startswith("linux"):
         return
     try:
-        # Terminate existing openvpn processes managing tun0 or using our vpngate configuration
-        subprocess.run(["pkill", "-f", "openvpn.*tun0"], capture_output=True, timeout=2)
-        subprocess.run(["pkill", "-f", "openvpn.*vpngate_data"], capture_output=True, timeout=2)
-        print("[Cleanup] Terminated existing AimiliVPN OpenVPN processes.", flush=True)
+        # Only terminate the tun0 (active egress) OpenVPN process. Detection
+        # probes run on tun1..tunN and MUST NOT be killed here, otherwise a
+        # routine cleanup tears down healthy probes or unrelated tunnels.
+        # The previous "openvpn.*vpngate_data" pattern matched every AimiliVPN
+        # process (all configs live under vpngate_data/), so any cleanup killed
+        # the live connection too — the root cause of "connected then dropped".
+        subprocess.run(["pkill", "-f", r"openvpn .*--dev tun0 "], capture_output=True, timeout=2)
+        print("[Cleanup] Terminated tun0 OpenVPN process.", flush=True)
     except Exception as e:
-        print(f"[Cleanup Error] Failed to kill existing OpenVPN processes: {e}", flush=True)
+        print(f"[Cleanup Error] Failed to kill tun0 OpenVPN process: {e}", flush=True)
 
 def update_handshake_status(line_lower: str) -> None:
     status_map = {
@@ -522,6 +588,89 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
+def test_tunnel_egress(dev: str, timeout: int = 8) -> tuple[bool, str]:
+    """Verify the tunnel actually passes traffic. The probe tunnel is started
+    with --route-nopull (no routes), so we must install a temporary route
+    'default via <peer> dev <dev>' in a per-device routing table and bind the
+    request to it. Binding curl alone (--interface) is unreliable because with
+    no route the packets have no next hop. Catches VPNGate nodes that complete
+    the handshake but cannot egress traffic — the cause of auto-switch loops."""
+    if not sys.platform.startswith("linux"):
+        return True, "non-linux: skip egress test"
+    peer = get_tun_peer_ip(dev)
+    if not peer:
+        return False, "egress test: no peer/gateway on tunnel"
+    # Derive a unique routing-table id from the tun index (tun5 -> 105) so
+    # concurrent probes don't collide.
+    m = re.search(r"(\d+)$", dev)
+    table = 100 + int(m.group(1)) if m else 199
+    src_m = None
+    try:
+        res = subprocess.run(["ip", "-o", "addr", "show", "dev", dev], capture_output=True, text=True, timeout=3)
+        src_m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", res.stdout)
+    except Exception:
+        pass
+    src_ip = src_m.group(1) if src_m else ""
+    rule_added = False
+    try:
+        subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "add", "default", "via", peer, "dev", dev, "table", str(table)], check=True, capture_output=True, timeout=2)
+        if src_ip:
+            subprocess.run(["ip", "rule", "add", "from", src_ip, "table", str(table)], check=True, capture_output=True, timeout=2)
+            rule_added = True
+        for url in ("https://api.ipify.org", "http://ip.sb"):
+            try:
+                res = subprocess.run(
+                    ["curl", "-4", "-s", "--interface", dev, "-w", "\n%{http_code}", url, "--max-time", str(timeout)],
+                    capture_output=True, text=True, timeout=timeout + 3,
+                )
+                if res.returncode == 0:
+                    lines = res.stdout.strip().splitlines()
+                    if len(lines) >= 2 and lines[-1].strip() == "200":
+                        ip = lines[0].strip()
+                        if ip and "." in ip:
+                            return True, ip
+            except Exception:
+                continue
+        return False, "egress traffic test failed (handshake ok but no traffic)"
+    finally:
+        if rule_added and src_ip:
+            subprocess.run(["ip", "rule", "del", "from", src_ip, "table", str(table)], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
+
+
+def get_tun_peer_ip(interface: str) -> str:
+    """Return the point-to-point peer (gateway) IP of a tun device, e.g. the
+    '10.x.x.x' in 'inet 10.211.1.37 peer 10.211.1.38'. The routing table needs
+    this as the next hop ('via'); without it a 'default dev tunX' route has no
+    gateway and traffic never leaves the tunnel."""
+    try:
+        res = subprocess.run(["ip", "-o", "addr", "show", "dev", interface], capture_output=True, text=True, timeout=3)
+        m = re.search(r"peer\s+(\d+\.\d+\.\d+\.\d+)", res.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def get_tun_src_ip(interface: str) -> str:
+    """Return the local source IP of a tun device (the 'inet' address). Used for
+    'ip rule add from <src>' policy routing. An 'oif <dev>' rule does NOT work
+    here: the routing decision runs before the output interface is known, so the
+    rule never matches and packets leak out the physical NIC with a tun source
+    address — which cloud anti-spoofing (e.g. GCP) then drops. Matching on the
+    source address works because SO_BINDTODEVICE fixes the source up front."""
+    try:
+        res = subprocess.run(["ip", "-o", "addr", "show", "dev", interface], capture_output=True, text=True, timeout=3)
+        m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", res.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 def setup_policy_routing(interface: str = "tun0") -> None:
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
@@ -531,25 +680,43 @@ def setup_policy_routing(interface: str = "tun0") -> None:
         subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
     except Exception:
         pass
-    
+
     success = False
     for attempt in range(1, 4):
+        peer = get_tun_peer_ip(interface)
+        src = get_tun_src_ip(interface)
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
-            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
+            if peer:
+                subprocess.run(["ip", "route", "add", "default", "via", peer, "dev", interface, "table", "100"], check=True, timeout=2)
+            else:
+                # Fallback: peer not detected yet (route should normally include via).
+                subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
+            # Match on source address, NOT 'oif': an 'oif' rule doesn't fire on
+            # the first routing pass, so packets leak out the physical NIC and
+            # GCP/cloud anti-spoofing drops them. SO_BINDTODEVICE in the proxy
+            # fixes the source IP up front, so 'from <src>' matches reliably.
+            if src:
+                subprocess.run(["ip", "rule", "add", "from", src, "table", "100"], check=True, timeout=2)
+            else:
+                subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            print(f"[policy_routing] Enabled policy routing for {interface} via {peer or '(no peer)'} from {src or '(oif fallback)'} (attempt {attempt} success)", flush=True)
             success = True
             break
         except Exception as e:
             print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
             time.sleep(1)
-            
+
     if not success:
         print("[policy_routing] Failed to enable policy routing after 3 attempts", flush=True)
 
 def cleanup_policy_routing() -> None:
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        # Remove ALL rules pointing at table 100 (there may be several stale
+        # 'from <src>' rules from previous nodes, each with a different src IP).
+        for _ in range(10):
+            res = subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+            if res.returncode != 0:
+                break
         subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
         print("[policy_routing] Cleared policy routing table 100", flush=True)
     except Exception:
@@ -631,13 +798,22 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
     latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-    
+
     idx = get_free_test_index()
+    dev_name = f"tun{idx}"
     try:
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, proc = run_openvpn_until_ready(config_file, keep_alive=True, route_nopull=True, timeout=12, dev=dev_name)
+        # Verify real egress traffic, not just a successful handshake.
+        if ok and proc is not None:
+            egress_ok, egress_info = test_tunnel_egress(dev_name)
+            if not egress_ok:
+                ok = False
+                message = egress_info
+        if proc is not None:
+            stop_process(proc)
     finally:
         release_test_index(idx)
-    
+
     try:
         if temp_path.exists():
             temp_path.unlink()
@@ -705,14 +881,27 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         dev_name = f"tun{idx + 1}"
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
-        
+        ok, message, proc = run_openvpn_until_ready(config_file, keep_alive=True, route_nopull=True, timeout=12, dev=dev_name)
+
+        # Handshake alone isn't enough: verify the tunnel actually egresses
+        # traffic, otherwise dead-but-handshaking nodes get marked available.
+        egress_ip = ""
+        if ok and proc is not None:
+            egress_ok, egress_info = test_tunnel_egress(dev_name)
+            if egress_ok:
+                egress_ip = egress_info
+            else:
+                ok = False
+                message = egress_info
+        if proc is not None:
+            stop_process(proc)
+
         try:
             if temp_path.exists():
                 temp_path.unlink()
         except Exception:
             pass
-            
+
         temp_node = {
             "id": node_id,
             "latency_ms": latency,
@@ -742,7 +931,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(to_test))) as executor:
+    max_parallel = min(8, max(1, len(to_test)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
             nid = futures[future]
@@ -817,12 +1007,13 @@ def auto_switch_node(attempt: int = 0) -> None:
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting
+    global active_openvpn_process, active_openvpn_node_id, is_connecting, connect_in_progress
     with lock:
         if is_connecting:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
             return "Already connecting"
         is_connecting = True
+        connect_in_progress = True
         active_openvpn_node_id = node_id
         set_state(active_openvpn_node_id=node_id, is_connecting=True, active_node_latency="正在连接", last_check_message="正在初始化连接配置...")
         
@@ -888,6 +1079,8 @@ def connect_node(node_id: str) -> str:
             item["active"] = item.get("id") == node_id
             if item["active"]:
                 item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+                item["used"] = True
+                item["last_used_at"] = time.time()
         write_json(NODES_FILE, nodes)
         
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
@@ -914,10 +1107,22 @@ def connect_node(node_id: str) -> str:
     finally:
         with lock:
             is_connecting = False
+            connect_in_progress = False
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
+    # Yield to an in-flight connect_node(): if a connection is currently being
+    # established, don't stomp on it with our own stop/start. Skip this round
+    # for periodic maintenance; for an explicit force request, wait briefly.
+    if connect_in_progress and not force:
+        print("[维护线程] 检测到连接操作进行中，跳过本轮维护以避免冲突", flush=True)
+        return "连接进行中，跳过本轮维护"
+    if force:
+        waited = 0.0
+        while connect_in_progress and waited < 20.0:
+            time.sleep(0.5)
+            waited += 0.5
     is_connecting = True
     try:
         if force:
@@ -948,26 +1153,35 @@ def maintain_valid_nodes(force: bool = False) -> str:
             return "没有拉取到新节点"
 
         with lock:
+            current_nodes = read_json(NODES_FILE, [])
             active_node = None
             if active_openvpn_node_id:
-                current_nodes = read_json(NODES_FILE, [])
                 active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
-                
+
             merged: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
-            
+
             if active_node:
                 merged.append(active_node)
                 seen_ids.add(active_node["id"])
-                
+
+            # Preserve previously-tested available nodes so the usable pool
+            # accumulates across fetches instead of being reset every cycle.
+            for old in current_nodes:
+                if old.get("id") in seen_ids:
+                    continue
+                if old.get("probe_status") == "available":
+                    merged.append(old)
+                    seen_ids.add(old["id"])
+
             for cand in candidates:
                 if cand["id"] not in seen_ids:
                     merged.append(cand)
                     seen_ids.add(cand["id"])
-                    
+
             if len(merged) > 1000:
                 merged = merged[:1000]
-                
+
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -975,16 +1189,19 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         config_path.write_text(n["config_text"], encoding="utf-8")
                     except Exception:
                         pass
-                        
+
             write_json(NODES_FILE, merged)
 
-        # Test the first 10 non-active nodes from the new list
+        # Prioritise testing not-yet-checked nodes; don't waste slots
+        # re-testing nodes already known to be available.
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            to_test = [n for n in current_nodes if not n.get("active")][:10]
+            unchecked = [n for n in current_nodes if not n.get("active") and n.get("probe_status") == "not_checked"]
+            others = [n for n in current_nodes if not n.get("active") and n.get("probe_status") != "not_checked" and n.get("probe_status") != "available"]
+            to_test = (unchecked + others)[:25]
             to_test_ids = [n["id"] for n in to_test]
-            
-        print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
+
+        print(f"[维护线程] 正在检测新获取列表的前 {len(to_test_ids)} 个节点: {to_test_ids}", flush=True)
         set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
         test_multiple_nodes(to_test_ids)
         
@@ -998,7 +1215,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested first 10 nodes."
+        message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} nodes. {valid_nodes_count} available."
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -1034,7 +1251,6 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AimiliVPN - 安全登录</title>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg-dark: #090d16;
@@ -1246,27 +1462,41 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   </div>
 
   <script>
+    async function checkExistingSession() {
+      try {
+        const response = await fetch("./api/session", { credentials: "same-origin" });
+        const data = await response.json();
+        if (response.ok && data.authorized) {
+          window.location.replace("./");
+        }
+      } catch (err) {
+      }
+    }
+
     async function handleLogin(e) {
       e.preventDefault();
       const uname = document.getElementById("username").value;
       const pwd = document.getElementById("password").value;
       const errorText = document.getElementById("error_text");
       const submitBtn = document.getElementById("submit_btn");
-      
+
       errorText.style.display = "none";
       submitBtn.disabled = true;
       submitBtn.querySelector("span").textContent = "正在验证...";
-      
+
       try {
         const response = await fetch("./api/login", {
           method: "POST",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ username: uname, password: pwd })
         });
-        
+
         const data = await response.json();
         if (response.ok && data.ok) {
-          window.location.reload();
+          setTimeout(() => {
+            window.location.replace("./");
+          }, 120);
         } else {
           errorText.textContent = data.error || "账号或密码不正确，请重新输入";
           errorText.style.display = "block";
@@ -1280,6 +1510,8 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         submitBtn.querySelector("span").textContent = "登录";
       }
     }
+
+    checkExistingSession();
   </script>
 </body>
 </html>
@@ -1292,8 +1524,6 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AimiliVPN 节点池管理系统</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-    
     :root {
       --bg-dark: #0b0f19;
       --bg-surface: rgba(22, 30, 49, 0.6);
@@ -1832,6 +2062,18 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid transparent;
     }
 
+    .badge-used {
+      margin-left: 6px;
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #a5b4fc;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      vertical-align: middle;
+    }
+
     .badge-pulse {
       width: 6px;
       height: 6px;
@@ -2223,6 +2465,13 @@ INDEX_HTML = r"""<!doctype html>
     <select id="country_filter">
       <option value="">所有国家</option>
     </select>
+    <select id="iptype_filter">
+      <option value="">所有 IP 类型</option>
+      <option value="residential">住宅 IP</option>
+      <option value="hosting">机房 IP</option>
+      <option value="proxy">代理 IP</option>
+      <option value="mobile">移动网</option>
+    </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -2457,8 +2706,12 @@ function updateCountryFilter() {
 function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
+  const selectedIpType = $("iptype_filter") ? $("iptype_filter").value : "";
   return nodes.filter(n => {
     if (selectedCountry && n.country !== selectedCountry) {
+      return false;
+    }
+    if (selectedIpType && n.ip_type !== selectedIpType) {
       return false;
     }
     const searchStr = [
@@ -2652,8 +2905,10 @@ function render(){
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
+      const usedBadge = n.used ? `<span class="badge-used" title="此节点曾被连接使用过">已用</span>` : "";
+
       return `<tr ${rowClass}>
-        <td><span class="badge ${badgeClass}">${badgeText}</span></td>
+        <td><span class="badge ${badgeClass}">${badgeText}</span>${usedBadge}</td>
         <td>${latencyText}</td>
         <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td>${esc(displayLocation)}</td>
@@ -2871,6 +3126,7 @@ async function load(){
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
+$("iptype_filter").onchange=()=>{ currentPage = 1; render(); };
 
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
@@ -3198,6 +3454,26 @@ def active_node_pinger() -> None:
         time.sleep(10)
 
 
+def session_janitor() -> None:
+    while True:
+        time.sleep(3600)
+        try:
+            now = time.time()
+            with lock:
+                expired = [tok for tok, exp in active_sessions.items() if exp <= now]
+                for tok in expired:
+                    active_sessions.pop(tok, None)
+                stale_ips = [ip for ip, (fails, until) in login_attempts.items() if until <= now]
+                for ip in stale_ips:
+                    login_attempts.pop(ip, None)
+                if expired:
+                    save_sessions()
+            if expired:
+                print(f"[会话清理] 已清除 {len(expired)} 个过期会话", flush=True)
+        except Exception as e:
+            print(f"[会话清理] 清理异常: {e}", flush=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     def get_secret_path(self) -> str:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -3228,20 +3504,22 @@ class Handler(BaseHTTPRequestHandler):
         pwd = ui_cfg.get("password")
         if not pwd:
             return True
-        
-        cookie_header = self.headers.get("Cookie", "")
-        cookies = {}
-        if cookie_header:
-            for item in cookie_header.split(";"):
-                item = item.strip()
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    cookies[k.strip()] = v.strip()
-        
-        session_token = cookies.get("session")
+
+        session_token = self.headers.get("X-Session", "").strip()
+        if not session_token:
+            cookie_header = self.headers.get("Cookie", "")
+            cookies = {}
+            if cookie_header:
+                for item in cookie_header.split(";"):
+                    item = item.strip()
+                    if "=" in item:
+                        k, v = item.split("=", 1)
+                        cookies[k.strip()] = v.strip()
+            session_token = cookies.get("session", "")
+
         if not session_token:
             return False
-            
+
         with lock:
             exp_time = active_sessions.get(session_token)
             if exp_time is not None and exp_time > time.time():
@@ -3281,7 +3559,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
-        
+
+        if effective_path == "/api/session":
+            try:
+                ui_cfg = load_ui_config()
+                self.send_json({
+                    "ok": True,
+                    "authorized": self.is_authorized(),
+                    "secret_path": ui_cfg.get("secret_path", "EJsW2EeBo9lY"),
+                    "username": ui_cfg.get("username", "admin"),
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "authorized": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         if not self.is_authorized():
             if effective_path in ("/", "/index.html"):
                 self.send_bytes(LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
@@ -3289,7 +3580,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
                 return
-                
+
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
@@ -3344,30 +3635,58 @@ class Handler(BaseHTTPRequestHandler):
         
         if effective_path == "/api/login":
             try:
+                client_ip = self.client_address[0] if self.client_address else "unknown"
+                locked_remaining = login_locked_remaining(client_ip)
+                if locked_remaining > 0:
+                    self.send_json(
+                        {"ok": False, "error": f"登录失败次数过多，请在 {int(locked_remaining) + 1} 秒后重试"},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 input_pwd = str(payload.get("password") or "")
                 input_uname = str(payload.get("username") or "")
-                
+
                 ui_cfg = load_ui_config()
                 expected_pwd = ui_cfg.get("password", "")
                 expected_uname = ui_cfg.get("username", "admin")
-                
-                if expected_pwd and input_pwd == expected_pwd and input_uname == expected_uname:
+
+                pwd_ok = bool(expected_pwd) and hmac.compare_digest(input_pwd, expected_pwd)
+                uname_ok = hmac.compare_digest(input_uname, expected_uname)
+                if pwd_ok and uname_ok:
+                    reset_login_failures(client_ip)
                     token = uuid.uuid4().hex
                     with lock:
                         active_sessions[token] = time.time() + 30 * 24 * 3600
+                        save_sessions()
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
-                    secret_path = self.get_secret_path()
-                    cookie_path = f"/{secret_path}/" if secret_path else "/"
-                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Set-Cookie", f"session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                    self.wfile.write(json.dumps({"ok": True, "session": token, "secret_path": ui_cfg.get("secret_path", "EJsW2EeBo9lY"), "username": expected_uname}).encode("utf-8"))
                 else:
+                    register_login_failure(client_ip)
+                    log_to_json("WARNING", "Auth", f"登录失败，来源 IP: {client_ip}")
                     self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/session":
+            try:
+                authorized = self.is_authorized()
+                ui_cfg = load_ui_config()
+                self.send_json({
+                    "ok": True,
+                    "authorized": authorized,
+                    "secret_path": ui_cfg.get("secret_path", "EJsW2EeBo9lY"),
+                    "username": ui_cfg.get("username", "admin"),
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "authorized": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/logout":
@@ -3384,11 +3703,10 @@ class Handler(BaseHTTPRequestHandler):
                 if session_token:
                     with lock:
                         active_sessions.pop(session_token, None)
-                secret_path = self.get_secret_path()
-                cookie_path = f"/{secret_path}/" if secret_path else "/"
+                        save_sessions()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Set-Cookie", f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                self.send_header("Set-Cookie", f"session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
                 self.end_headers()
                 self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
             except Exception as exc:
@@ -3420,7 +3738,7 @@ class Handler(BaseHTTPRequestHandler):
                 expected_uname = ui_cfg.get("username", "admin")
                 expected_pwd = ui_cfg.get("password", "")
                 
-                if curr_username != expected_uname or curr_password != expected_pwd:
+                if not (hmac.compare_digest(curr_username, expected_uname) and hmac.compare_digest(curr_password, expected_pwd)):
                     self.send_json({"ok": False, "error": "当前账号或密码不正确"}, HTTPStatus.FORBIDDEN)
                     return
                 
@@ -3462,7 +3780,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+                threading.Thread(target=maintain_valid_nodes, args=(True,), daemon=True).start()
+                self.send_json({"ok": True, "message": "已在后台启动强制刷新与节点检测流程"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":
@@ -3554,6 +3873,7 @@ class Tee:
 
 def main() -> None:
     ensure_dirs()
+    load_sessions()
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
@@ -3605,6 +3925,7 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=session_janitor, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)

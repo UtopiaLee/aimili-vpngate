@@ -31,8 +31,8 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
+# Default to the UtopiaLee fork (UtopiaLee/aimili-vpngate)
+DEFAULT_USER="UtopiaLee"
 DEFAULT_REPO="aimili-vpngate"
 
 # Allow custom repository override via command line arguments
@@ -575,7 +575,7 @@ def configure_credentials():
         print("  [3] 返回主菜单")
         print("=======================================================")
         print("请直接输入数字键 [1-3] 快速执行：", end="", flush=True)
-        
+
         key = getch()
         if key == '1':
             print("\033[H\033[J", end="")
@@ -601,7 +601,7 @@ def configure_credentials():
             save_ui_cfg(cfg)
             print("密码随机重置成功！")
             print(f"您的全新12位安全密码为: {new_pwd}")
-            print("密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")
+            print("密码已保存在本地，打开安全后缀地址后刷新浏览器即可登录。")
             input("\n按任意键返回菜单...")
         elif key == '3' or key == 'q' or key == '\x03':
             break

@@ -35,3 +35,6 @@ scratch/
 # Local analysis and doc files
 AimiliVPN_Analysis_ZH.md
 
+# Codegraph local index
+.codegraph/
+
