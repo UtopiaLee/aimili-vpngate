@@ -15,6 +15,34 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
+UI_AUTH_FILE = DATA_DIR / "ui_auth.json"
+
+# Scamalytics fraud-score API (optional). Read from ui_auth.json first (set via
+# the web admin panel), falling back to environment variables. The key never
+# enters the repo. Without it, purity falls back to the free sources.
+SCAMALYTICS_HOST = os.environ.get("SCAMALYTICS_HOST", "api13.scamalytics.com")
+
+
+def get_scamalytics_config() -> tuple[str, str, str]:
+    """Return (user, key, host). UI config takes precedence over env vars."""
+    user = os.environ.get("SCAMALYTICS_USER", "")
+    key = os.environ.get("SCAMALYTICS_KEY", "")
+    host = SCAMALYTICS_HOST
+    try:
+        if UI_AUTH_FILE.exists():
+            cfg = json.loads(UI_AUTH_FILE.read_text(encoding="utf-8"))
+            user = cfg.get("scamalytics_user") or user
+            key = cfg.get("scamalytics_key") or key
+            host = cfg.get("scamalytics_host") or host
+    except Exception:
+        pass
+    return user, key, host
+
+
+# Cache TTLs (seconds). Purity changes slowly, so a long TTL keeps API usage
+# near zero — well under free quotas. Override via env if needed.
+IP_CACHE_TTL = int(os.environ.get("IP_CACHE_TTL", str(7 * 24 * 3600)))
+PURITY_CACHE_TTL = int(os.environ.get("PURITY_CACHE_TTL", str(30 * 24 * 3600)))
 
 ip_cache_lock = threading.RLock()
 
@@ -333,7 +361,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         ip = node.get("ip") or node.get("remote_host")
         if not ip:
             continue
-        if ip in cache and now - cache[ip].get("cached_at", 0) < 7 * 24 * 3600:
+        if ip in cache and now - cache[ip].get("cached_at", 0) < IP_CACHE_TTL:
             cached = cache[ip]
             node["owner"] = cached.get("owner", "")
             node["asn"] = cached.get("asn", "")
@@ -420,3 +448,227 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["location"] = cached.get("location", "")
             node["ip_type"] = cached.get("ip_type", "")
             node["quality"] = cached.get("quality", "")
+
+
+PURITY_CACHE_FILE = DATA_DIR / "purity_cache.json"
+purity_cache_lock = threading.RLock()
+
+
+def load_purity_cache() -> dict[str, dict[str, Any]]:
+    with purity_cache_lock:
+        try:
+            if PURITY_CACHE_FILE.exists():
+                return json.loads(PURITY_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+
+def save_purity_cache(cache: dict[str, dict[str, Any]]) -> None:
+    with purity_cache_lock:
+        try:
+            DATA_DIR.mkdir(exist_ok=True)
+            PURITY_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _parse_abuser_level(raw: Any) -> tuple[float, str]:
+    """ipapi.is company.abuser_score looks like '0.0039 (Low)' or '1 (Very High)'.
+    Return (numeric_score, level_text)."""
+    score = 0.0
+    level = ""
+    try:
+        s = str(raw)
+        m = re.match(r"\s*([\d.]+)", s)
+        if m:
+            score = float(m.group(1))
+        lm = re.search(r"\(([^)]+)\)", s)
+        if lm:
+            level = lm.group(1).strip()
+    except Exception:
+        pass
+    return score, level
+
+
+def _fetch_json(url: str, timeout: float = 8.0) -> dict[str, Any]:
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "vpngate-manager/2.2"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+def _compute_purity(ipapi: dict[str, Any], pxchk: dict[str, Any], ipapi_com: dict[str, Any], sca: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Aggregate free sources into a 0-100 purity score, modelled on the
+    iprisk.top weighting. Higher score = cleaner. Optionally includes
+    Scamalytics fraud score when an API key is configured. Returns score, level,
+    flags and a per-item breakdown (each item: name, got, max, note)."""
+    company = ipapi.get("company") or {}
+    asn = ipapi.get("asn") or {}
+    abuser_score, abuser_level = _parse_abuser_level(company.get("abuser_score"))
+    sca = sca or {}
+    sca_block = sca.get("scamalytics") or {}
+    sca_score = sca_block.get("scamalytics_score")
+    try:
+        sca_score = int(sca_score)
+    except (TypeError, ValueError):
+        sca_score = -1
+    sca_proxy = sca_block.get("scamalytics_proxy") or {}
+
+    is_tor = bool(ipapi.get("is_tor")) or str(pxchk.get("type", "")).upper() == "TOR"
+    px_type = str(pxchk.get("type", ""))
+    px_is_proxy = str(pxchk.get("proxy", "")).lower() == "yes"
+    px_risk = pxchk.get("risk")
+    try:
+        px_risk = int(px_risk)
+    except (TypeError, ValueError):
+        px_risk = -1
+    # VPN 以 proxycheck 的 type 为准(ipapi 的 is_vpn 误报多), scamalytics 辅助
+    is_vpn = px_type.upper() in ("VPN", "OPENVPN", "WIREGUARD") or "vpn" in px_type.lower() or bool(sca_proxy.get("is_vpn"))
+    is_proxy = px_is_proxy or bool(ipapi.get("is_proxy")) or bool(ipapi_com.get("proxy"))
+    is_datacenter = bool(ipapi.get("is_datacenter")) or bool(ipapi_com.get("hosting")) or bool(sca_proxy.get("is_datacenter"))
+    ip_type_str = str(company.get("type") or asn.get("type") or "").lower()
+    is_isp = ip_type_str == "isp" and not is_datacenter
+
+    detail = []
+    score = 0
+
+    # IP 类型判定 (40): ISP/住宅满分, 机房大扣分
+    if is_isp:
+        got = 40; note = "住宅/ISP"
+    elif is_datacenter:
+        got = 12; note = "机房 IP"
+    elif ip_type_str == "business":
+        got = 28; note = "商业网络"
+    else:
+        got = 24; note = "类型未知"
+    score += got; detail.append({"name": "IP类型", "got": got, "max": 40, "note": note})
+
+    # Tor 检测 (8)
+    got = 0 if is_tor else 8
+    score += got; detail.append({"name": "Tor暗网", "got": got, "max": 8, "note": "Tor出口" if is_tor else "非Tor"})
+
+    # VPN 检测 (10)
+    got = 2 if is_vpn else 10
+    score += got; detail.append({"name": "VPN检测", "got": got, "max": 10, "note": f"命中({px_type})" if is_vpn else "未命中"})
+
+    # 代理检测 (10)
+    got = 3 if is_proxy else 10
+    score += got; detail.append({"name": "代理检测", "got": got, "max": 10, "note": "命中" if is_proxy else "无代理"})
+
+    # proxycheck 风险分 (12): risk 越高扣越多
+    if px_risk < 0:
+        got = 8; note = "无数据"
+    else:
+        got = max(0, round(12 * (1 - px_risk / 100.0)))
+        note = f"risk={px_risk}"
+    score += got; detail.append({"name": "代理风险", "got": got, "max": 12, "note": note})
+
+    # 滥用历史 (8): abuser_score 0..1, 越高越脏
+    got = max(0, round(8 * (1 - min(1.0, abuser_score))))
+    score += got; detail.append({"name": "滥用历史", "got": got, "max": 8, "note": abuser_level or f"{abuser_score:.3f}"})
+
+    # Scamalytics 欺诈分 (7): 0-100, 越高越脏。无 key 时给满分(不惩罚)
+    if sca_score < 0:
+        got = 7; note = "未启用"
+    else:
+        got = max(0, round(7 * (1 - sca_score / 100.0)))
+        note = f"欺诈{sca_score}"
+    score += got; detail.append({"name": "欺诈评分", "got": got, "max": 7, "note": note})
+
+    # 数据中心标记 (5)
+    got = 0 if is_datacenter else 5
+    score += got; detail.append({"name": "数据中心", "got": got, "max": 5, "note": "是" if is_datacenter else "否"})
+
+    # 关键风险信号封顶: 命中明确的高危信号时大幅压低总分,
+    # 避免坏 IP 因基础分(IP类型等)虚高而被误判为可用。
+    if is_tor:
+        score = min(score, 25)  # Tor 出口 -> 高危
+    elif is_proxy and px_risk >= 80:
+        score = min(score, 40)  # 高风险代理
+    elif sca_score >= 90:
+        score = min(score, 55)  # Scamalytics 判极高欺诈
+    elif is_vpn or (is_proxy and px_risk >= 50):
+        score = min(score, 60)  # VPN/中风险代理 -> 至多"有风险"
+
+    score = max(0, min(100, int(round(score))))
+    if score >= 85:
+        level = "纯净"
+    elif score >= 65:
+        level = "良好"
+    elif score >= 45:
+        level = "有风险"
+    else:
+        level = "高危"
+
+    return {
+        "purity_score": score,
+        "purity_level": level,
+        "purity_detail": detail,
+        "is_tor": is_tor,
+        "is_proxy": is_proxy,
+        "is_vpn": is_vpn,
+        "is_abuser": abuser_score >= 0.1,
+        "px_risk": px_risk,
+    }
+
+
+def enrich_purity(nodes: list[dict[str, Any]]) -> None:
+    """Aggregate ipapi.is + proxycheck.io + ip-api.com into a 0-100 purity score
+    (modelled on iprisk.top). Attaches purity_score, purity_level, purity_detail
+    and is_tor/is_proxy/is_vpn flags. Cached 7 days. Failures are silent."""
+    fields = ["purity_score", "purity_level", "purity_detail", "is_tor", "is_proxy", "is_vpn", "is_abuser", "px_risk"]
+    with purity_cache_lock:
+        cache = load_purity_cache()
+    now = time.time()
+    to_query = []
+    for node in nodes:
+        ip = node.get("ip") or node.get("remote_host")
+        if not ip:
+            continue
+        c = cache.get(ip)
+        if c and now - c.get("cached_at", 0) < PURITY_CACHE_TTL and "purity_detail" in c:
+            for f in fields:
+                if f in c:
+                    node[f] = c[f]
+        elif ip not in to_query:
+            to_query.append(ip)
+
+    new_entries: dict[str, dict[str, Any]] = {}
+    sca_user, sca_key, sca_host = get_scamalytics_config()
+    for ip in to_query:
+        try:
+            qip = urllib.parse.quote(ip)
+            ipapi = _fetch_json(f"https://api.ipapi.is/?q={qip}")
+            pxchk_raw = _fetch_json(f"https://proxycheck.io/v2/{qip}?vpn=1&risk=1")
+            pxchk = pxchk_raw.get(ip, {}) if isinstance(pxchk_raw, dict) else {}
+            ipapi_com = _fetch_json(f"http://ip-api.com/json/{qip}?fields=proxy,hosting,mobile,query")
+            sca = {}
+            if sca_user and sca_key:
+                sca = _fetch_json(
+                    f"https://{sca_host}/v3/{sca_user}/?key={sca_key}&ip={qip}"
+                )
+            if not ipapi and not pxchk and not ipapi_com:
+                continue  # 免费源全失败,不写缓存,下次重试
+            result = _compute_purity(ipapi, pxchk, ipapi_com, sca)
+            result["cached_at"] = now
+            new_entries[ip] = result
+        except Exception as e:
+            print(f"[enrich_purity] Query failed for {ip}: {e}", flush=True)
+
+    if not new_entries:
+        return
+
+    with purity_cache_lock:
+        cache = load_purity_cache()
+        cache.update(new_entries)
+        save_purity_cache(cache)
+
+    for node in nodes:
+        ip = node.get("ip") or node.get("remote_host")
+        if ip in new_entries:
+            for f in fields:
+                if f in new_entries[ip]:
+                    node[f] = new_entries[ip][f]

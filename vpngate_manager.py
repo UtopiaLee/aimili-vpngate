@@ -48,6 +48,8 @@ LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
+# 默认不在启动/维护后自动连接节点,等用户手动选择。设为 1 恢复自动连接。
+AUTO_CONNECT = os.environ.get("AUTO_CONNECT", "0") == "1"
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -56,6 +58,7 @@ NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
+HISTORY_FILE = DATA_DIR / "history.json"
 
 lock = threading.RLock()
 active_sessions: dict[str, float] = {}
@@ -70,6 +73,11 @@ is_connecting = True
 # from is_connecting (which also covers startup and UI state) so maintenance
 # can yield specifically to an in-flight connection without deadlocking.
 connect_in_progress = False
+# Monotonic counter bumped on every connect_node() call. A connection in
+# progress checks whether it's still the latest generation; if a newer connect
+# request arrived, the older one aborts so the user's new pick takes over
+# instead of being rejected with "Already connecting".
+connect_gen = 0
 last_active_ping_time = 0.0
 last_active_latency = 0
 
@@ -256,6 +264,70 @@ def log_to_json(level: str, module: str, message: str) -> None:
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
+def read_history() -> list[dict[str, Any]]:
+    return read_json(HISTORY_FILE, [])
+
+def add_to_history(node: dict[str, Any]) -> None:
+    """Record a connected node into the permanent usage history, keyed by IP.
+    Re-connecting an existing IP refreshes its last_used_at and latest metadata
+    but preserves the user's note."""
+    ip = node.get("ip") or node.get("remote_host")
+    if not ip:
+        return
+    with lock:
+        history = read_json(HISTORY_FILE, [])
+        existing = next((h for h in history if h.get("ip") == ip), None)
+        now = time.time()
+        snapshot = {
+            "ip": ip,
+            "node_id": node.get("id", ""),
+            "country": node.get("country", ""),
+            "country_short": node.get("country_short", ""),
+            "location": node.get("location", ""),
+            "owner": node.get("owner", ""),
+            "asn": node.get("asn", ""),
+            "ip_type": node.get("ip_type", ""),
+            "purity_score": node.get("purity_score"),
+            "purity_level": node.get("purity_level", ""),
+            "remote_host": node.get("remote_host", ""),
+            "remote_port": node.get("remote_port", 0),
+            "proto": node.get("proto", ""),
+            "last_used_at": now,
+        }
+        if existing:
+            note = existing.get("note", "")
+            first_used = existing.get("first_used_at", now)
+            use_count = existing.get("use_count", 0) + 1
+            existing.update(snapshot)
+            existing["note"] = note
+            existing["first_used_at"] = first_used
+            existing["use_count"] = use_count
+        else:
+            snapshot["note"] = ""
+            snapshot["first_used_at"] = now
+            snapshot["use_count"] = 1
+            history.append(snapshot)
+        write_json(HISTORY_FILE, history)
+
+def update_history_note(ip: str, note: str) -> bool:
+    with lock:
+        history = read_json(HISTORY_FILE, [])
+        item = next((h for h in history if h.get("ip") == ip), None)
+        if not item:
+            return False
+        item["note"] = note
+        write_json(HISTORY_FILE, history)
+        return True
+
+def delete_history_entry(ip: str) -> bool:
+    with lock:
+        history = read_json(HISTORY_FILE, [])
+        new_history = [h for h in history if h.get("ip") != ip]
+        if len(new_history) == len(history):
+            return False
+        write_json(HISTORY_FILE, new_history)
+        return True
+
 def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
@@ -280,7 +352,10 @@ def get_state() -> dict[str, Any]:
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
-    
+    state["scamalytics_user"] = ui_cfg.get("scamalytics_user", "")
+    # key 不回传明文,仅用占位符表示"已配置"
+    state["scamalytics_key_set"] = bool(ui_cfg.get("scamalytics_key"))
+
     return state
 
 def safe_name(value: str) -> str:
@@ -513,7 +588,7 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", should_abort: Any = None) -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
@@ -550,6 +625,9 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     ok = False
     message = "OpenVPN did not complete initialization."
     while time.time() - started < limit:
+        if should_abort is not None and should_abort():
+            stop_process(process)
+            return False, "ABORTED: superseded by a newer connect request", None
         try:
             line = lines.get(timeout=0.5)
         except queue.Empty:
@@ -834,6 +912,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     }
     if ok:
         vpn_utils.enrich_ip_info([temp_node])
+        vpn_utils.enrich_purity([temp_node])
 
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -850,6 +929,12 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["location"] = temp_node["location"]
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
+                node["purity_score"] = temp_node.get("purity_score", 0)
+                node["purity_level"] = temp_node.get("purity_level", "")
+                node["is_tor"] = temp_node.get("is_tor", False)
+                node["is_proxy"] = temp_node.get("is_proxy", False)
+                node["is_vpn"] = temp_node.get("is_vpn", False)
+                node["is_abuser"] = temp_node.get("is_abuser", False)
             
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
@@ -927,6 +1012,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 "quality": "",
             }
             vpn_utils.enrich_ip_info([ip_to_enrich])
+            vpn_utils.enrich_purity([ip_to_enrich])
             temp_node.update(ip_to_enrich)
         return temp_node
 
@@ -1007,16 +1093,25 @@ def auto_switch_node(attempt: int = 0) -> None:
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting, connect_in_progress
+    global active_openvpn_process, active_openvpn_node_id, is_connecting, connect_in_progress, connect_gen
     with lock:
-        if is_connecting:
-            print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
-            return "Already connecting"
+        # 抢占式: 每次连接请求递增代次。若已有连接在进行,停掉它 —— 那个旧的
+        # connect_node 会在 should_abort 检查时发现代次已变而主动退出,从而把
+        # 控制权让给用户新选的节点,而不是直接拒绝导致"卡死无法切换"。
+        connect_gen += 1
+        my_gen = connect_gen
+        was_connecting = is_connecting
+        if was_connecting:
+            print(f"[连接] 抢占正在进行的连接,切换到新节点: {node_id}", flush=True)
+            stop_active_openvpn()
         is_connecting = True
         connect_in_progress = True
         active_openvpn_node_id = node_id
         set_state(active_openvpn_node_id=node_id, is_connecting=True, active_node_latency="正在连接", last_check_message="正在初始化连接配置...")
-        
+
+    def aborted() -> bool:
+        return connect_gen != my_gen
+
     try:
         log_to_json("INFO", "VPN", f"开始连接节点: {node_id}")
         nodes = read_json(NODES_FILE, [])
@@ -1036,7 +1131,11 @@ def connect_node(node_id: str) -> str:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=20, should_abort=aborted)
+        if aborted():
+            # 被更新的连接请求抢占,放弃本次,不污染状态(抢占者会接管)
+            stop_process(process)
+            return "Superseded"
         if not ok or process is None:
             try:
                 if config_path.exists():
@@ -1063,18 +1162,10 @@ def connect_node(node_id: str) -> str:
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
         last_active_latency = 0
-        
-        set_state(active_node_latency="测试延迟", last_check_message="正在直连测试代理出口延迟与可用性...")
-        try:
-            ip = node.get("ip") or node.get("remote_host")
-            port = parse_int(node.get("remote_port"))
-            fallback = parse_int(node.get("ping"))
-            latency = vpn_utils.ping_latency_ms(ip, port, fallback)
-            if latency > 0:
-                last_active_latency = latency
-        except Exception:
-            pass
-            
+
+        # 立即标记节点为活动并写入历史 —— 握手+路由已成功,节点此刻已可用。
+        # 延迟测试与出口健康检查改为后台异步执行,避免阻塞切换(原来这两步
+        # 串行最多多花 ~12 秒,是"切换慢"的主因)。
         for item in nodes:
             item["active"] = item.get("id") == node_id
             if item["active"]:
@@ -1082,32 +1173,55 @@ def connect_node(node_id: str) -> str:
                 item["used"] = True
                 item["last_used_at"] = time.time()
         write_json(NODES_FILE, nodes)
-        
-        set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
-        res = check_proxy_health()
-        if res["ok"]:
-            set_state(
-                proxy_ok=True,
-                proxy_ip=res["ip"],
-                proxy_latency_ms=res["latency_ms"],
-                proxy_error=""
-            )
-        else:
-            set_state(
-                proxy_ok=False,
-                proxy_ip="-",
-                proxy_latency_ms=0,
-                proxy_error=res.get("error", "未知错误")
-            )
-            
-        latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
-        set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
+
+        # 记录到永久使用历史(以连接成功的节点为准)
+        try:
+            connected_node = next((n for n in nodes if n.get("id") == node_id), None)
+            if connected_node:
+                add_to_history(connected_node)
+        except Exception as e:
+            print(f"[历史记录] 写入失败: {e}", flush=True)
+
+        # 连接成功立即返回。后台异步测延迟 + 出口健康(不阻塞用户)。
+        set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency="测试中...")
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+
+        def post_connect_checks(target_id: str, check_gen: int) -> None:
+            global last_active_latency
+            # 若已被新的连接抢占则放弃
+            if connect_gen != check_gen:
+                return
+            try:
+                ip2 = node.get("ip") or node.get("remote_host")
+                port2 = parse_int(node.get("remote_port"))
+                fallback2 = parse_int(node.get("ping"))
+                lat = vpn_utils.ping_latency_ms(ip2, port2, fallback2)
+                if lat > 0:
+                    last_active_latency = lat
+                    if connect_gen == check_gen and active_openvpn_node_id == target_id:
+                        set_state(active_node_latency=f"{lat} ms")
+            except Exception:
+                pass
+            try:
+                res = check_proxy_health()
+                if connect_gen != check_gen or active_openvpn_node_id != target_id:
+                    return
+                if res["ok"]:
+                    set_state(proxy_ok=True, proxy_ip=res["ip"], proxy_latency_ms=res["latency_ms"], proxy_error="")
+                else:
+                    set_state(proxy_ok=False, proxy_ip="-", proxy_latency_ms=0, proxy_error=res.get("error", "未知错误"))
+            except Exception:
+                pass
+
+        threading.Thread(target=post_connect_checks, args=(node_id, my_gen), daemon=True).start()
         return f"Connected {node_id}"
     finally:
         with lock:
-            is_connecting = False
-            connect_in_progress = False
+            # 仅当自己仍是最新代次时才清除连接中标志。被抢占的旧调用退出时
+            # 不能清,否则会误清掉抢占者(新连接)的进行中状态。
+            if connect_gen == my_gen:
+                is_connecting = False
+                connect_in_progress = False
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -1206,10 +1320,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
         test_multiple_nodes(to_test_ids)
         
         is_connecting = False
-        
+
         with lock:
             merged = read_json(NODES_FILE, [])
-            if not active_openvpn_running():
+            # 默认不自动连接,等用户手动选择节点。设 AUTO_CONNECT=1 可恢复自动连接。
+            if AUTO_CONNECT and not active_openvpn_running():
                 available_candidates = [n for n in merged if n.get("probe_status") == "available"]
                 if available_candidates:
                     auto_switch_node()
@@ -2367,34 +2482,6 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-  <section class="ad-section">
-    <div class="ad-card">
-      <div class="ad-title">
-        <span class="ad-badge">推荐</span> <strong>购买高性价比 VPS 搭建节点或用作客户端</strong>
-      </div>
-      <div class="ad-links">
-        <div class="ad-item">
-          <span class="ad-tag tag-normal">普通用户推荐</span>
-          <span class="ad-desc">RackNerd - 超低折扣价格，日常使用实惠方便，海外多机房可选，推荐普通家庭或低频用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-opt">网络优化推荐</span>
-          <span class="ad-desc">VMiss - 专线优化网络 (CN2 GIA/9929/CMIN2 等顶级线路)，低延迟不丢包，推荐高网络要求用户。</span>
-          <a href="https://app.vmiss.com/aff.php?aff=4619" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-premium">高端企业推荐</span>
-          <span class="ad-desc">BandwagonHost (搬瓦工) - 直连三网顶级专线，经典高带宽 CN2 GIA 线路，超凡稳定速度。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-      </div>
-      <div class="ad-footer">
-        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
-      </div>
-    </div>
-  </section>
-
   <!-- 当前连接活动节点卡片 -->
   <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
     <!-- Rendered dynamically by render() -->
@@ -2461,6 +2548,13 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 
+  <!-- 视图切换标签 -->
+  <div class="view-tabs" style="display:flex; gap:8px; margin-bottom:16px;">
+    <button id="tab_pool" class="view-tab active" onclick="switchView('pool')" style="height:38px; padding:0 20px; border-radius:8px; font-weight:600; font-size:14px; cursor:pointer; border:1px solid var(--border-color); background:var(--primary-gradient); color:#fff;">节点池</button>
+    <button id="tab_history" class="view-tab" onclick="switchView('history')" style="height:38px; padding:0 20px; border-radius:8px; font-weight:600; font-size:14px; cursor:pointer; border:1px solid var(--border-color); background:rgba(255,255,255,0.04); color:var(--text-primary);">使用历史 <span id="history_count" style="font-size:12px; opacity:0.7;"></span></button>
+  </div>
+
+  <div id="view_pool">
   <section class="toolbar">
     <select id="country_filter">
       <option value="">所有国家</option>
@@ -2483,14 +2577,15 @@ INDEX_HTML = r"""<!doctype html>
       <table>
         <thead>
           <tr>
-            <th style="width: 110px;">状态</th>
-            <th style="width: 100px;">延迟</th>
+            <th style="width: 110px; cursor:pointer; user-select:none;" onclick="toggleSort('status')" title="点击按状态排序">状态<span id="sort_arrow_status"></span></th>
+            <th style="width: 100px; cursor:pointer; user-select:none;" onclick="toggleSort('latency')" title="点击按延迟排序">延迟<span id="sort_arrow_latency"></span></th>
             <th style="width: 220px;">IP 地址 : 端口</th>
             <th>物理位置</th>
             <th style="width: 100px;">ASN</th>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">网络质量</th>
             <th style="width: 110px;">IP 类型</th>
+            <th style="width: 120px; cursor:pointer; user-select:none;" onclick="toggleSort('purity')" title="点击按纯净度排序">纯净度<span id="sort_arrow_purity"></span></th>
             <th style="width: 160px;">操作</th>
           </tr>
         </thead>
@@ -2511,6 +2606,67 @@ INDEX_HTML = r"""<!doctype html>
         </span>
         <button id="btn_next_page" class="connect-btn" style="height: 32px; padding: 0 10px;">下一页</button>
         <button id="btn_last_page" class="connect-btn" style="height: 32px; padding: 0 10px;">尾页</button>
+      </div>
+    </div>
+  </div>
+  </div><!-- /view_pool -->
+
+  <!-- 使用历史视图 -->
+  <div id="view_history" style="display:none;">
+    <section class="toolbar">
+      <input id="history_search" placeholder="搜索 IP、备注、国家、运营商..." style="flex:1;" />
+      <button id="btn_refresh_history" class="connect-btn" onclick="loadHistory()" style="height:42px; padding:0 18px;">刷新</button>
+    </section>
+    <div class="table-wrapper">
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:170px;">IP 地址</th>
+              <th>物理位置</th>
+              <th style="width:110px;">纯净度</th>
+              <th>备注 (双击编辑)</th>
+              <th style="width:150px;">上次使用</th>
+              <th style="width:90px;">次数</th>
+              <th style="width:200px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="history_rows"></tbody>
+        </table>
+      </div>
+      <div style="padding:12px 16px; font-size:13px; color:var(--text-secondary); border-top:1px solid var(--border-color);">
+        共 <span id="history_total" style="color:var(--text-primary); font-weight:600;">0</span> 条历史记录 · 备注会永久保存,即使节点下线
+      </div>
+    </div>
+  </div>
+
+  <!-- 备注编辑 Modal -->
+  <div id="note_modal" class="modal">
+    <div class="modal-content" style="max-width:440px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h3 style="margin:0; font-size:18px; font-weight:700; color:var(--text-primary);">编辑 IP 备注</h3>
+        <button onclick="closeNoteModal()" style="background:none; border:none; color:var(--text-secondary); font-size:22px; cursor:pointer; line-height:1;">&times;</button>
+      </div>
+      <div style="font-size:13px; color:var(--text-secondary); margin-bottom:8px;">IP: <span id="note_ip" class="mono" style="color:var(--text-primary);"></span></div>
+      <textarea id="note_input" class="input-field" rows="3" placeholder="记录此 IP 用途,例如:注册了 ChatGPT / TikTok 小号 / 亚马逊店铺" style="width:100%; height:auto; padding:12px; resize:vertical; font-family:inherit; box-sizing:border-box;"></textarea>
+      <div id="note_error" style="color:var(--danger); font-size:13px; margin-top:8px; display:none;"></div>
+      <div style="display:flex; gap:12px; margin-top:20px;">
+        <button onclick="closeNoteModal()" class="connect-btn" style="flex:1; height:42px;">取消</button>
+        <button id="note_save_btn" onclick="saveNote()" class="btn-primary" style="flex:1; height:42px; border:none; border-radius:8px; color:#fff; font-weight:600; cursor:pointer;">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast_container" style="position:fixed; top:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:10px;"></div>
+
+  <!-- 通用确认 Modal -->
+  <div id="confirm_modal" class="modal">
+    <div class="modal-content" style="max-width:400px;">
+      <h3 id="confirm_title" style="margin:0 0 12px 0; font-size:17px; font-weight:700; color:var(--text-primary);">请确认</h3>
+      <div id="confirm_message" style="font-size:14px; color:var(--text-secondary); line-height:1.6; margin-bottom:24px;"></div>
+      <div style="display:flex; gap:12px;">
+        <button id="confirm_cancel_btn" class="connect-btn" style="flex:1; height:42px;">取消</button>
+        <button id="confirm_ok_btn" class="btn-primary" style="flex:1; height:42px; border:none; border-radius:8px; color:#fff; font-weight:600; cursor:pointer;">确定</button>
       </div>
     </div>
   </div>
@@ -2555,6 +2711,21 @@ INDEX_HTML = r"""<!doctype html>
             <input type="password" id="settings_new_password" class="input-field" placeholder="留空则不修改">
           </div>
         </div>
+
+        <div style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 16px; margin-bottom: 16px;">
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 4px;">Scamalytics 欺诈评分 (可选)</div>
+          <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 12px; line-height:1.5;">配置后 IP 纯净度检测将额外接入 Scamalytics 欺诈评分,评分更准。免费注册 <span style="color:var(--primary);">scamalytics.com/ip/api</span> 获取账号和 Key。留空则使用免费多源检测。</div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_sca_user">Scamalytics 账号 (API username)</label>
+            <input type="text" id="settings_sca_user" class="input-field" placeholder="">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="settings_sca_key">Scamalytics API Key</label>
+            <input type="text" id="settings_sca_key" class="input-field" placeholder="留空不改 · 清空账号与Key可停用">
+          </div>
+        </div>
         
         <div style="margin-bottom: 24px;">
           <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">安全验证 (必须输入当前账号密码)</div>
@@ -2583,6 +2754,9 @@ let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
 const pageSize = 11;
 let currentPageNodes = [];
+// 当前页排序状态: column 为 null 时用默认顺序; dir 1=升序 -1=降序
+let sortColumn = null;
+let sortDir = 1;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -2598,6 +2772,37 @@ const translateQuality = q => {
 const translateIpType = t => {
   const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "proxy": "代理 IP"};
   return dict[t] || t || "-";
+};
+
+const purityBadge = n => {
+  // 未检测
+  if (typeof n.purity_score !== "number") {
+    return '<span style="color:var(--text-secondary);">-</span>';
+  }
+  const score = n.purity_score;  // 0-100, 越高越纯净
+  // 分数 -> 中文等级 + 颜色
+  let text, color, bg;
+  if (score >= 85) {
+    text = "纯净"; color = "#34d399"; bg = "rgba(16,185,129,0.15)";
+  } else if (score >= 65) {
+    text = "良好"; color = "#a3e635"; bg = "rgba(132,204,22,0.15)";
+  } else if (score >= 45) {
+    text = "有风险"; color = "#fbbf24"; bg = "rgba(245,158,11,0.15)";
+  } else {
+    text = "高危"; color = "#fb7185"; bg = "rgba(244,63,94,0.15)";
+  }
+  // Tor/代理/VPN 额外标记
+  const flags = [];
+  if (n.is_tor) flags.push("Tor");
+  if (n.is_vpn) flags.push("VPN");
+  else if (n.is_proxy) flags.push("代理");
+  const flagStr = flags.length ? `<span style="font-size:10px; color:#fb7185; margin-left:4px;">${flags.join("/")}</span>` : "";
+  // 明细做成悬停提示
+  let tip = `综合纯净度 ${score}/100 (${text})`;
+  if (Array.isArray(n.purity_detail)) {
+    tip += "\n" + n.purity_detail.map(d => `${d.name}: ${d.got}/${d.max} (${d.note})`).join("\n");
+  }
+  return `<span class="purity-badge" style="padding:2px 8px; border-radius:5px; font-size:12px; font-weight:600; color:${color}; background:${bg}; cursor:help;" title="${esc(tip)}">${score} ${text}</span>${flagStr}`;
 };
 
 const translateCountry = c => {
@@ -2724,11 +2929,245 @@ function getFilteredNodes() {
 
 function stableSortNodes() {
   nodes.sort((a, b) => {
+    // 纯净度高的排最前(未检测纯净度的视为最低,排在已检测节点之后)
+    const pa = typeof a.purity_score === "number" ? a.purity_score : -1;
+    const pb = typeof b.purity_score === "number" ? b.purity_score : -1;
+    if (pb !== pa) return pb - pa;
+    // 纯净度相同(或都未检测)时,按 VPNGate 评分降序
     if ((b.score || 0) !== (a.score || 0)) {
       return (b.score || 0) - (a.score || 0);
     }
     return a.id.localeCompare(b.id);
   });
+}
+
+function sortKey(n, col) {
+  if (col === "status") {
+    // available=0(最优) > not_checked=1 > unavailable=2
+    const order = {"available": 0, "not_checked": 1, "unavailable": 2};
+    return order[n.probe_status] !== undefined ? order[n.probe_status] : 3;
+  }
+  if (col === "latency") {
+    const v = parseInt(n.latency_ms);
+    return (isNaN(v) || v <= 0) ? Infinity : v;  // 无延迟排最后
+  }
+  if (col === "purity") {
+    const v = typeof n.purity_score === "number" ? n.purity_score : NaN;
+    return isNaN(v) ? Infinity : v;  // 未检测排最后
+  }
+  return 0;
+}
+
+function sortPageNodes(arr) {
+  return arr.slice().sort((a, b) => {
+    const ka = sortKey(a, sortColumn);
+    const kb = sortKey(b, sortColumn);
+    // Infinity(无数据)始终排末尾,不受升降序影响
+    if (ka === Infinity && kb === Infinity) return 0;
+    if (ka === Infinity) return 1;
+    if (kb === Infinity) return -1;
+    if (ka < kb) return -1 * sortDir;
+    if (ka > kb) return 1 * sortDir;
+    return 0;
+  });
+}
+
+function toggleSort(col) {
+  if (sortColumn === col) {
+    sortDir = -sortDir;  // 同列再点切换升降序
+  } else {
+    sortColumn = col;
+    sortDir = 1;
+  }
+  render();
+}
+
+// ===== 使用历史 =====
+let historyData = [];
+let currentView = "pool";
+
+function switchView(view) {
+  currentView = view;
+  const isPool = view === "pool";
+  $("view_pool").style.display = isPool ? "" : "none";
+  $("view_history").style.display = isPool ? "none" : "";
+  // tab 高亮
+  $("tab_pool").style.background = isPool ? "var(--primary-gradient)" : "rgba(255,255,255,0.04)";
+  $("tab_pool").style.color = isPool ? "#fff" : "var(--text-primary)";
+  $("tab_history").style.background = !isPool ? "var(--primary-gradient)" : "rgba(255,255,255,0.04)";
+  $("tab_history").style.color = !isPool ? "#fff" : "var(--text-primary)";
+  if (!isPool) loadHistory();
+}
+
+async function loadHistory() {
+  try {
+    const res = await fetch("./api/history", { credentials: "same-origin" });
+    const data = await res.json();
+    historyData = data.history || [];
+    renderHistory();
+  } catch (e) {
+    $("history_rows").innerHTML = `<tr><td colspan="7" style="text-align:center; color:var(--danger); padding:30px;">加载历史失败</td></tr>`;
+  }
+}
+
+function fmtTime(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function getFilteredHistory() {
+  const q = $("history_search").value.trim().toLowerCase();
+  if (!q) return historyData;
+  return historyData.filter(h => {
+    const s = [h.ip, h.note, h.country, h.location, h.owner, h.asn, h.country_short].join(" ").toLowerCase();
+    return s.includes(q);
+  });
+}
+
+function renderHistory() {
+  const list = getFilteredHistory();
+  $("history_count").textContent = historyData.length ? `(${historyData.length})` : "";
+  $("history_total").textContent = list.length;
+  if (!list.length) {
+    $("history_rows").innerHTML = `<tr><td colspan="7" style="text-align:center; color:var(--text-secondary); padding:40px;">${historyData.length ? "无匹配记录" : "还没有使用过任何节点。连接节点后会自动记录在这里。"}</td></tr>`;
+    return;
+  }
+  $("history_rows").innerHTML = list.map(h => {
+    const loc = esc(h.location || translateCountry(h.country) || h.country_short || "-");
+    const note = h.note ? esc(h.note) : '<span style="color:var(--text-secondary); font-style:italic;">双击添加备注</span>';
+    const purity = purityBadge(h);
+    return `<tr>
+      <td class="mono">${esc(h.ip)}</td>
+      <td>${loc}</td>
+      <td>${purity}</td>
+      <td ondblclick="editNote('${esc(h.ip)}')" style="cursor:text;" title="双击编辑备注">${note}</td>
+      <td style="font-size:12px; color:var(--text-secondary);">${fmtTime(h.last_used_at)}</td>
+      <td style="text-align:center;">${h.use_count || 1}</td>
+      <td>
+        <div class="table-actions">
+          <button class="connect-btn" onclick="connectFromHistory('${esc(h.ip)}')" title="切换到此节点(需当前在线)">切换</button>
+          <button class="test-btn" onclick="editNote('${esc(h.ip)}')">备注</button>
+          <button class="test-btn" onclick="deleteHistory('${esc(h.ip)}')" style="color:var(--danger);">删除</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function showToast(message, type) {
+  const box = document.createElement("div");
+  const ok = type !== "error";
+  box.textContent = message;
+  box.style.cssText = "min-width:220px; max-width:340px; padding:12px 16px; border-radius:10px; font-size:14px; color:#fff; box-shadow:0 8px 24px rgba(0,0,0,0.3); opacity:0; transform:translateX(20px); transition:all 0.25s ease; background:" + (ok ? "linear-gradient(135deg,#10b981,#059669)" : "linear-gradient(135deg,#f43f5e,#e11d48)") + ";";
+  $("toast_container").appendChild(box);
+  requestAnimationFrame(() => { box.style.opacity = "1"; box.style.transform = "translateX(0)"; });
+  setTimeout(() => {
+    box.style.opacity = "0"; box.style.transform = "translateX(20px)";
+    setTimeout(() => box.remove(), 300);
+  }, type === "error" ? 4000 : 2500);
+}
+
+function confirmModal(message, title) {
+  return new Promise(resolve => {
+    $("confirm_title").textContent = title || "请确认";
+    $("confirm_message").textContent = message;
+    $("confirm_modal").style.display = "flex";
+    const ok = $("confirm_ok_btn"), cancel = $("confirm_cancel_btn");
+    const close = (val) => {
+      $("confirm_modal").style.display = "none";
+      ok.onclick = null; cancel.onclick = null;
+      resolve(val);
+    };
+    ok.onclick = () => close(true);
+    cancel.onclick = () => close(false);
+  });
+}
+
+let noteEditingIp = null;
+
+function editNote(ip) {
+  const item = historyData.find(h => h.ip === ip);
+  noteEditingIp = ip;
+  $("note_ip").textContent = ip;
+  $("note_input").value = item ? (item.note || "") : "";
+  $("note_error").style.display = "none";
+  $("note_modal").style.display = "flex";
+  setTimeout(() => $("note_input").focus(), 50);
+}
+
+function closeNoteModal() {
+  $("note_modal").style.display = "none";
+  noteEditingIp = null;
+}
+
+async function saveNote() {
+  if (!noteEditingIp) return;
+  const ip = noteEditingIp;
+  const note = $("note_input").value;
+  const btn = $("note_save_btn");
+  const errEl = $("note_error");
+  errEl.style.display = "none";
+  btn.disabled = true; btn.textContent = "保存中...";
+  try {
+    const res = await fetch("./api/history/note", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip, note })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      const item = historyData.find(h => h.ip === ip);
+      if (item) item.note = note;
+      closeNoteModal();
+      renderHistory();
+    } else {
+      errEl.textContent = data.error || "保存失败";
+      errEl.style.display = "block";
+    }
+  } catch (e) {
+    errEl.textContent = "保存失败,请重试";
+    errEl.style.display = "block";
+  } finally {
+    btn.disabled = false; btn.textContent = "保存";
+  }
+}
+
+async function connectFromHistory(ip) {
+  if (!(await confirmModal(`切换到 ${ip}?\n若该节点已从 VPNGate 下线则无法连接。`, "切换节点"))) return;
+  try {
+    const res = await fetch("./api/history/connect", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      switchView("pool");
+      await load();
+    } else {
+      showToast(data.error || "切换失败", "error");
+    }
+  } catch (e) { showToast("切换失败", "error"); }
+}
+
+async function deleteHistory(ip) {
+  if (!(await confirmModal(`删除 ${ip} 的历史记录?备注也会一并删除。`, "删除历史记录"))) return;
+  try {
+    const res = await fetch("./api/history/delete", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      historyData = historyData.filter(h => h.ip !== ip);
+      renderHistory();
+    } else {
+      showToast(data.error || "删除失败", "error");
+    }
+  } catch (e) { showToast("删除失败", "error"); }
 }
 
 function render(){
@@ -2880,9 +3319,14 @@ function render(){
   const endIndex = Math.min(startIndex + pageSize, shown.length);
   currentPageNodes = shown.slice(startIndex, endIndex);
 
+  // 仅对当前页节点排序(点击表头触发)
+  if (sortColumn) {
+    currentPageNodes = sortPageNodes(currentPageNodes);
+  }
+
   // Render table rows
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    $("rows").innerHTML = `<tr><td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       const isCurrentlyActive = activeNode && n.id === activeNode.id;
@@ -2916,6 +3360,7 @@ function render(){
         <td>${esc(n.owner||n.as_name||"-")}</td>
         <td>${esc(translateQuality(n.quality))}</td>
         <td>${esc(translateIpType(n.ip_type))}</td>
+        <td>${purityBadge(n)}</td>
         <td>
           <div class="table-actions">
             ${testBtn}
@@ -2932,6 +3377,12 @@ function render(){
   $("filtered_count").textContent = shown.length;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
+
+  // 更新排序箭头指示器
+  ["status", "latency", "purity"].forEach(col => {
+    const el = $("sort_arrow_" + col);
+    if (el) el.textContent = (sortColumn === col) ? (sortDir === 1 ? " ▲" : " ▼") : "";
+  });
   
   $("btn_first_page").disabled = currentPage === 1;
   $("btn_prev_page").disabled = currentPage === 1;
@@ -3025,7 +3476,7 @@ async function connectNode(id){
     });
     const result = await r.json();
     if (!result.ok) {
-      alert("连接失败: " + (result.error || "未知错误"));
+      showToast("连接失败: " + (result.error || "未知错误"), "error");
       if (pollInterval) {
         clearInterval(pollInterval);
         pollInterval = null;
@@ -3035,7 +3486,7 @@ async function connectNode(id){
       return;
     }
   } catch(e) {
-    alert("连接请求错误");
+    showToast("连接请求错误", "error");
     if (pollInterval) {
       clearInterval(pollInterval);
       pollInterval = null;
@@ -3046,7 +3497,7 @@ async function connectNode(id){
 }
 
 async function disconnectNode(){
-  if (!confirm("确定要断开当前的 VPN 连接吗？")) return;
+  if (!(await confirmModal("确定要断开当前的 VPN 连接吗?", "断开连接"))) return;
   try {
     const response = await fetch("./api/disconnect", { method: "POST" });
     const result = await response.json();
@@ -3056,10 +3507,10 @@ async function disconnectNode(){
       } catch(pe){}
       load();
     } else {
-      alert("断开连接失败: " + (result.error || "未知错误"));
+      showToast("断开连接失败: " + (result.error || "未知错误"), "error");
     }
   } catch (e) {
-    alert("请求断开连接失败");
+    showToast("请求断开连接失败", "error");
   }
 }
 
@@ -3067,7 +3518,7 @@ async function disconnectNode(){
 $("btn_batch_test").onclick = async () => {
   const pageNodes = currentPageNodes || [];
   if (pageNodes.length === 0) {
-    alert("当前页面没有可供测试的备选节点");
+    showToast("当前页面没有可供测试的备选节点", "error");
     return;
   }
   
@@ -3127,6 +3578,7 @@ async function load(){
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("iptype_filter").onchange=()=>{ currentPage = 1; render(); };
+$("history_search").oninput=()=>{ renderHistory(); };
 
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
@@ -3206,6 +3658,9 @@ function openSettingsModal() {
   if (state) {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
+    $("settings_sca_user").value = state.scamalytics_user || "";
+    // key 已配置则显示占位符(提交时原样回传表示"不修改")
+    $("settings_sca_key").value = state.scamalytics_key_set ? "********" : "";
   }
   
   $("settings_modal").style.display = "flex";
@@ -3229,6 +3684,8 @@ async function saveSettings(e) {
   const suffix = $("settings_suffix").value.trim();
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
+  const scaUser = $("settings_sca_user").value.trim();
+  const scaKey = $("settings_sca_key").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
   const currPassword = $("settings_curr_password").value.trim();
   
@@ -3256,6 +3713,8 @@ async function saveSettings(e) {
         secret_path: suffix,
         new_username: newUsername,
         new_password: newPassword,
+        scamalytics_user: scaUser,
+        scamalytics_key: scaKey,
         curr_username: currUsername,
         curr_password: currPassword
       })
@@ -3583,6 +4042,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        elif effective_path == "/api/history":
+            history = read_history()
+            history.sort(key=lambda h: h.get("last_used_at", 0), reverse=True)
+            self.send_json({"history": history})
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_json(NODES_FILE, [])
@@ -3729,6 +4192,8 @@ class Handler(BaseHTTPRequestHandler):
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
+                new_sca_user = str(payload.get("scamalytics_user") or "").strip()
+                new_sca_key = str(payload.get("scamalytics_key") or "").strip()
                 
                 if not curr_username or not curr_password:
                     self.send_json({"ok": False, "error": "请输入当前账号和密码进行安全验证"}, HTTPStatus.FORBIDDEN)
@@ -3760,7 +4225,23 @@ class Handler(BaseHTTPRequestHandler):
                     ui_cfg["username"] = new_username
                 if new_password:
                     ui_cfg["password"] = new_password
-                
+
+                # Scamalytics: 成对设置或成对清空。只填一个则报错。
+                # 前端为避免泄露,key 回显为占位符 "********"; 收到占位符表示"不修改"。
+                if new_sca_key != "********":
+                    if new_sca_user and new_sca_key:
+                        ui_cfg["scamalytics_user"] = new_sca_user
+                        ui_cfg["scamalytics_key"] = new_sca_key
+                    elif not new_sca_user and not new_sca_key:
+                        ui_cfg.pop("scamalytics_user", None)
+                        ui_cfg.pop("scamalytics_key", None)
+                    else:
+                        self.send_json({"ok": False, "error": "Scamalytics 账号和 Key 需同时填写,或同时留空以停用"}, HTTPStatus.BAD_REQUEST)
+                        return
+                elif new_sca_user:
+                    # key 不变(占位符),仅更新 user
+                    ui_cfg["scamalytics_user"] = new_sca_user
+
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -3819,6 +4300,45 @@ class Handler(BaseHTTPRequestHandler):
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/history/note":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                ip = str(payload.get("ip") or "")
+                note = str(payload.get("note") or "")[:500]
+                if update_history_note(ip, note):
+                    self.send_json({"ok": True})
+                else:
+                    self.send_json({"ok": False, "error": "未找到该历史记录"}, HTTPStatus.NOT_FOUND)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/history/delete":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                ip = str(payload.get("ip") or "")
+                if delete_history_entry(ip):
+                    self.send_json({"ok": True})
+                else:
+                    self.send_json({"ok": False, "error": "未找到该历史记录"}, HTTPStatus.NOT_FOUND)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/history/connect":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                ip = str(payload.get("ip") or "")
+                # 历史里的 IP 必须当前仍在可用节点池中才能连接
+                nodes = read_json(NODES_FILE, [])
+                target = next((n for n in nodes if (n.get("ip") or n.get("remote_host")) == ip), None)
+                if not target:
+                    self.send_json({"ok": False, "error": "该节点已不在当前可用列表中(VPNGate 节点可能已下线),无法切换"}, HTTPStatus.NOT_FOUND)
+                elif target.get("probe_status") == "unavailable":
+                    self.send_json({"ok": False, "error": "该节点当前检测为不可用,无法切换"}, HTTPStatus.CONFLICT)
+                else:
+                    self.send_json({"ok": True, "message": connect_node(target["id"])})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
