@@ -50,13 +50,23 @@ apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc pyt
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
+# 执行安装脚本即视为要强制更新：移除本地开发模式标记，确保页面/代码被覆盖
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
-    echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
-else
-    if [ -d "${INSTALL_DIR}" ]; then
-        echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
-        cd "${INSTALL_DIR}"
-        git fetch --all || true
+    echo -e "${YELLOW}  -> 检测到 .local_dev 标记，执行安装即强制更新，正在移除该标记...${PLAIN}"
+    rm -f "${INSTALL_DIR}/.local_dev"
+fi
+if [ -d "${INSTALL_DIR}" ]; then
+    echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码（页面/代码）..."
+    cd "${INSTALL_DIR}"
+    # 确保 origin 指向目标仓库（仓库地址可能因参数变化）
+    if git remote get-url origin >/dev/null 2>&1; then
+        git remote set-url origin "${GITHUB_URL}" || true
+    else
+        git remote add origin "${GITHUB_URL}" || true
+    fi
+    if ! git fetch origin --prune; then
+        echo -e "${YELLOW}  -> 警告: git fetch 失败（网络问题？），将保留当前本地源码并继续安装。${PLAIN}"
+    else
         BRANCH="main"
         if git rev-parse --verify origin/main >/dev/null 2>&1; then
             BRANCH="main"
@@ -65,22 +75,22 @@ else
         fi
         echo -e "  -> 正在强制重置本地源码至 origin/${BRANCH} ..."
         if git reset --hard "origin/${BRANCH}"; then
-            echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
+            # 清除 tracked 路径下的游离文件（.gitignore 保护 vpngate_data/ 等数据目录，不会被删）
+            git clean -fd
+            echo -e "${GREEN}  -> 源码（页面/代码）已强制更新至最新版本！${PLAIN}"
         else
-            if git pull; then
-                echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
-            else
-                echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
-            fi
+            echo -e "${YELLOW}  -> 警告: git reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
         fi
+    fi
+    # 清理 Python 字节码缓存，避免运行旧的 .pyc
+    find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+else
+    echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
+    if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
+        echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
     else
-        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
-        if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
-            echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
-        else
-            echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
-            exit 1
-        fi
+        echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
+        exit 1
     fi
 fi
 
@@ -449,6 +459,8 @@ def update_service():
             
             print(f"\n正在强制重置本地代码至 origin/{branch} ...", flush=True)
             subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], check=True)
+            # Remove stray untracked files in tracked paths (.gitignore protects vpngate_data/, logs, etc.)
+            subprocess.run(["git", "clean", "-fd"], check=False)
             
             # Clean up python cache files
             print("正在清理 Python 缓存 (pycache)...", flush=True)
