@@ -10,6 +10,7 @@ import re
 import select
 import shlex
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -169,7 +170,40 @@ def load_ui_config() -> dict[str, Any]:
                 
         return config
 
-def get_session_token(password: str, username: str = "admin") -> str:
+def validate_ssl_cert(cert_path: str, key_path: str) -> tuple[bool, str]:
+    """校验证书与私钥是否可用于开启 HTTPS。
+    返回 (True, "") 表示可用；(False, 原因) 表示不可用。
+    检查：路径非空、文件存在、能被 SSLContext 加载（隐含校验 cert/key 配对、格式正确、未过期到无法加载）。"""
+    cert_path = (cert_path or "").strip()
+    key_path = (key_path or "").strip()
+    if not cert_path or not key_path:
+        return False, "证书路径和私钥路径都必须填写"
+    if not os.path.isfile(cert_path):
+        return False, f"证书文件不存在: {cert_path}"
+    if not os.path.isfile(key_path):
+        return False, f"私钥文件不存在: {key_path}"
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    except ssl.SSLError as exc:
+        return False, f"证书/私钥加载失败（可能不匹配或格式错误）: {exc}"
+    except Exception as exc:
+        return False, f"证书校验异常: {exc}"
+    return True, ""
+
+def make_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext | None:
+    """根据证书路径构建可用于 wrap_socket 的 SSLContext；任何问题返回 None。"""
+    ok, _ = validate_ssl_cert(cert_path, key_path)
+    if not ok:
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert_path.strip(), keyfile=key_path.strip())
+        return ctx
+    except Exception:
+        return None
+
+
     salt = "aimilivpn_secure_salt_2026"
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
@@ -355,6 +389,10 @@ def get_state() -> dict[str, Any]:
     state["scamalytics_user"] = ui_cfg.get("scamalytics_user", "")
     # key 不回传明文,仅用占位符表示"已配置"
     state["scamalytics_key_set"] = bool(ui_cfg.get("scamalytics_key"))
+    # HTTPS 证书路径（非密钥内容，可回填以便编辑）
+    state["ssl_cert"] = ui_cfg.get("ssl_cert", "")
+    state["ssl_key"] = ui_cfg.get("ssl_key", "")
+    state["https_enabled"] = bool(ui_cfg.get("ssl_cert") and ui_cfg.get("ssl_key"))
 
     return state
 
@@ -2726,6 +2764,21 @@ INDEX_HTML = r"""<!doctype html>
             <input type="text" id="settings_sca_key" class="input-field" placeholder="留空不改 · 清空账号与Key可停用">
           </div>
         </div>
+
+        <div style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 16px; margin-bottom: 16px;">
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 4px;">HTTPS 证书 (可选)</div>
+          <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 12px; line-height:1.5;">填写服务器上证书与私钥的<strong>绝对路径</strong>(如 Let's Encrypt 的 fullchain.pem 与 privkey.pem)。保存时会先校验证书是否可用,通过后才启用 HTTPS 并重启。两项同时留空可停用 HTTPS 回退 HTTP。</div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_ssl_cert">证书路径 (cert / fullchain)</label>
+            <input type="text" id="settings_ssl_cert" class="input-field" placeholder="/etc/letsencrypt/live/域名/fullchain.pem">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="settings_ssl_key">私钥路径 (private key)</label>
+            <input type="text" id="settings_ssl_key" class="input-field" placeholder="/etc/letsencrypt/live/域名/privkey.pem">
+          </div>
+        </div>
         
         <div style="margin-bottom: 24px;">
           <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">安全验证 (必须输入当前账号密码)</div>
@@ -3661,6 +3714,8 @@ function openSettingsModal() {
     $("settings_sca_user").value = state.scamalytics_user || "";
     // key 已配置则显示占位符(提交时原样回传表示"不修改")
     $("settings_sca_key").value = state.scamalytics_key_set ? "********" : "";
+    $("settings_ssl_cert").value = state.ssl_cert || "";
+    $("settings_ssl_key").value = state.ssl_key || "";
   }
   
   $("settings_modal").style.display = "flex";
@@ -3686,6 +3741,8 @@ async function saveSettings(e) {
   const newPassword = $("settings_new_password").value.trim();
   const scaUser = $("settings_sca_user").value.trim();
   const scaKey = $("settings_sca_key").value.trim();
+  const sslCert = $("settings_ssl_cert").value.trim();
+  const sslKey = $("settings_ssl_key").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
   const currPassword = $("settings_curr_password").value.trim();
   
@@ -3715,6 +3772,8 @@ async function saveSettings(e) {
         new_password: newPassword,
         scamalytics_user: scaUser,
         scamalytics_key: scaKey,
+        ssl_cert: sslCert,
+        ssl_key: sslKey,
         curr_username: currUsername,
         curr_password: currPassword
       })
@@ -3729,9 +3788,10 @@ async function saveSettings(e) {
       inputs.forEach(el => el.disabled = true);
       
       setTimeout(() => {
-        const protocol = window.location.protocol;
+        // 目标协议按本次提交的证书状态推断：两项都填好 -> https，否则 http
+        const targetProtocol = (sslCert && sslKey) ? "https:" : "http:";
         const host = window.location.hostname;
-        window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+        window.location.href = `${targetProtocol}//${host}:${port}/${suffix}/`;
       }, 4000);
     } else {
       errorDivEl.textContent = data.error || "保存失败，请检查输入";
@@ -4194,6 +4254,11 @@ class Handler(BaseHTTPRequestHandler):
                 new_password = str(payload.get("new_password") or "").strip()
                 new_sca_user = str(payload.get("scamalytics_user") or "").strip()
                 new_sca_key = str(payload.get("scamalytics_key") or "").strip()
+                # SSL 证书/私钥路径：键名缺省表示"不修改"，空字符串表示"清空停用"
+                ssl_cert_provided = "ssl_cert" in payload
+                ssl_key_provided = "ssl_key" in payload
+                new_ssl_cert = str(payload.get("ssl_cert") or "").strip()
+                new_ssl_key = str(payload.get("ssl_key") or "").strip()
                 
                 if not curr_username or not curr_password:
                     self.send_json({"ok": False, "error": "请输入当前账号和密码进行安全验证"}, HTTPStatus.FORBIDDEN)
@@ -4241,6 +4306,24 @@ class Handler(BaseHTTPRequestHandler):
                 elif new_sca_user:
                     # key 不变(占位符),仅更新 user
                     ui_cfg["scamalytics_user"] = new_sca_user
+
+                # HTTPS 证书：仅当本次请求带了 ssl_cert/ssl_key 键时才处理。
+                # 两个都有值 -> 先校验，通过才启用；校验失败直接返回错误，不写入不重启。
+                # 两个都为空 -> 停用 HTTPS（回退 HTTP）。只填一个 -> 报错。
+                if ssl_cert_provided or ssl_key_provided:
+                    if new_ssl_cert and new_ssl_key:
+                        ok, err = validate_ssl_cert(new_ssl_cert, new_ssl_key)
+                        if not ok:
+                            self.send_json({"ok": False, "error": f"HTTPS 证书校验失败：{err}"}, HTTPStatus.BAD_REQUEST)
+                            return
+                        ui_cfg["ssl_cert"] = new_ssl_cert
+                        ui_cfg["ssl_key"] = new_ssl_key
+                    elif not new_ssl_cert and not new_ssl_key:
+                        ui_cfg.pop("ssl_cert", None)
+                        ui_cfg.pop("ssl_key", None)
+                    else:
+                        self.send_json({"ok": False, "error": "证书路径和私钥路径需同时填写，或同时留空以停用 HTTPS"}, HTTPStatus.BAD_REQUEST)
+                        return
 
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
@@ -4450,10 +4533,25 @@ def main() -> None:
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
     ui_port = int(ui_cfg.get("port", UI_PORT))
-    
-    print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
+
+    ssl_cert = str(ui_cfg.get("ssl_cert") or "").strip()
+    ssl_key = str(ui_cfg.get("ssl_key") or "").strip()
+    ssl_ctx = None
+    if ssl_cert and ssl_key:
+        ok, err = validate_ssl_cert(ssl_cert, ssl_key)
+        if ok:
+            ssl_ctx = make_ssl_context(ssl_cert, ssl_key)
+        if ssl_ctx is None:
+            print(f"[警告] HTTPS 证书校验失败，回退至 HTTP。原因: {err or '未知'}", flush=True)
+
+    scheme = "https" if ssl_ctx else "http"
+    print(f"UI: {scheme}://{ui_host}:{ui_port}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
-    ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
+    httpd = ThreadingHTTPServer((ui_host, ui_port), Handler)
+    if ssl_ctx:
+        httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
+        print("[安全] HTTPS 已启用。", flush=True)
+    httpd.serve_forever()
 
 if __name__ == "__main__":
     main()
